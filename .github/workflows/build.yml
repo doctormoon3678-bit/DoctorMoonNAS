@@ -1,0 +1,520 @@
+name: APK 빌드
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.10.2"
+
+      - name: 프로젝트 파일 만들기
+        run: |
+          mkdir -p "proj/."
+          cat > "proj/build.gradle" <<'__NAS_EOF__'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+          }
+          __NAS_EOF__
+          mkdir -p "proj/."
+          cat > "proj/gradle.properties" <<'__NAS_EOF__'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.nonTransitiveRClass=true
+          __NAS_EOF__
+          mkdir -p "proj/."
+          cat > "proj/settings.gradle" <<'__NAS_EOF__'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "NasAdmin"
+          include ':app'
+          __NAS_EOF__
+          mkdir -p "proj/app"
+          cat > "proj/app/build.gradle" <<'__NAS_EOF__'
+          plugins {
+              id 'com.android.application'
+          }
+
+          android {
+              namespace 'com.doctormoon.nasadmin'
+              compileSdk 35
+
+              defaultConfig {
+                  applicationId "com.doctormoon.nasadmin"
+                  minSdk 21          // 안드로이드 5.0 이상 (노트3/4 OK)
+                  targetSdk 34
+                  versionCode 1
+                  versionName "1.0"
+              }
+
+              buildTypes {
+                  release {
+                      minifyEnabled false
+                      signingConfig signingConfigs.debug
+                  }
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_1_8
+                  targetCompatibility JavaVersion.VERSION_1_8
+              }
+
+              lint {
+                  abortOnError false
+                  checkReleaseBuilds false
+              }
+          }
+          __NAS_EOF__
+          mkdir -p "proj/app/src/main"
+          cat > "proj/app/src/main/AndroidManifest.xml" <<'__NAS_EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <!-- Termux에게 서버 켜기 명령을 보내는 권한 (Termux를 먼저 설치해야 부여됨) -->
+              <uses-permission android:name="com.termux.permission.RUN_COMMAND" />
+              <!-- 다운로드 폴더에 저장 (안드로이드 9 이하) -->
+              <uses-permission
+                  android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+                  android:maxSdkVersion="28" />
+
+              <queries>
+                  <package android:name="com.termux" />
+              </queries>
+
+              <application
+                  android:allowBackup="false"
+                  android:icon="@drawable/ic_launcher"
+                  android:label="@string/app_name"
+                  android:networkSecurityConfig="@xml/network_security_config"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar"
+                  android:usesCleartextTraffic="true">
+
+                  <activity
+                      android:name=".MainActivity"
+                      android:configChanges="orientation|screenSize|screenLayout|keyboardHidden"
+                      android:exported="true"
+                      android:launchMode="singleTask"
+                      android:windowSoftInputMode="adjustResize">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          __NAS_EOF__
+          mkdir -p "proj/app/src/main/java/com/doctormoon/nasadmin"
+          cat > "proj/app/src/main/java/com/doctormoon/nasadmin/MainActivity.java" <<'__NAS_EOF__'
+          package com.doctormoon.nasadmin;
+
+          import android.app.Activity;
+          import android.app.DownloadManager;
+          import android.content.ActivityNotFoundException;
+          import android.content.ClipData;
+          import android.content.Context;
+          import android.content.Intent;
+          import android.net.Uri;
+          import android.os.Build;
+          import android.os.Bundle;
+          import android.os.Environment;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.webkit.CookieManager;
+          import android.webkit.DownloadListener;
+          import android.webkit.JavascriptInterface;
+          import android.webkit.URLUtil;
+          import android.webkit.ValueCallback;
+          import android.webkit.WebChromeClient;
+          import android.webkit.WebSettings;
+          import android.webkit.WebView;
+          import android.webkit.WebViewClient;
+          import android.widget.Toast;
+
+          import java.net.HttpURLConnection;
+          import java.net.URL;
+          import java.net.URLDecoder;
+          import java.util.regex.Matcher;
+          import java.util.regex.Pattern;
+
+          /**
+           * NAS 관리자 앱
+           * - 폰 안의 NAS 서버(http://127.0.0.1:8080)를 앱 화면으로 보여줌 → 인터넷 없이도 동작
+           * - 파일 업로드(파일 선택창), 다운로드, 뒤로가기 지원
+           * - 서버가 꺼져 있으면 안내 화면을 띄우고, Termux에 서버 켜기 명령을 보낸 뒤 자동 재연결
+           */
+          public class MainActivity extends Activity {
+
+              static final String BASE = "http://127.0.0.1:8080/";
+              static final String OFFLINE_PAGE = "file:///android_asset/offline.html";
+              static final String START_SCRIPT = "/data/data/com.termux/files/home/.termux/boot/start-nas.sh";
+              static final int REQ_FILE = 1;
+
+              private WebView web;
+              private ValueCallback<Uri[]> fileCallback;
+              private final Handler handler = new Handler(Looper.getMainLooper());
+              private volatile boolean offline = false;
+              private volatile boolean probing = false;
+              private boolean triedAutoStart = false;
+
+              @Override
+              protected void onCreate(Bundle saved) {
+                  super.onCreate(saved);
+                  web = new WebView(this);
+                  setContentView(web);
+
+                  WebSettings s = web.getSettings();
+                  s.setJavaScriptEnabled(true);
+                  s.setDomStorageEnabled(true);
+                  s.setBuiltInZoomControls(false);
+                  s.setSupportMultipleWindows(false);   // window.open → 같은 화면에서 열기
+                  CookieManager.getInstance().setAcceptCookie(true);
+
+                  web.addJavascriptInterface(new Bridge(), "NASApp");
+
+                  web.setWebViewClient(new WebViewClient() {
+                      @Override
+                      public boolean shouldOverrideUrlLoading(WebView view, String url) {
+                          if (url.startsWith(BASE) || url.startsWith("file:///android_asset/")) return false;
+                          try {   // 외부 링크는 브라우저로
+                              startActivity(new Intent(Intent.ACTION_VIEW, Uri.parse(url)));
+                          } catch (Exception ignored) { }
+                          return true;
+                      }
+
+                      @Override
+                      public void onReceivedError(WebView view, int code, String desc, String failingUrl) {
+                          if (failingUrl != null && failingUrl.startsWith(BASE)) showOffline();
+                      }
+
+                      @Override
+                      public void onPageFinished(WebView view, String url) {
+                          if (url != null && url.startsWith(BASE)) offline = false;
+                      }
+                  });
+
+                  web.setWebChromeClient(new WebChromeClient() {
+                      @Override
+                      public boolean onShowFileChooser(WebView view, ValueCallback<Uri[]> cb,
+                                                       FileChooserParams params) {
+                          if (fileCallback != null) fileCallback.onReceiveValue(null);
+                          fileCallback = cb;
+                          Intent i = new Intent(Intent.ACTION_GET_CONTENT);
+                          i.addCategory(Intent.CATEGORY_OPENABLE);
+                          i.setType("*/*");
+                          i.putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+                          try {
+                              startActivityForResult(Intent.createChooser(i, "업로드할 파일 선택"), REQ_FILE);
+                          } catch (ActivityNotFoundException e) {
+                              fileCallback = null;
+                              cb.onReceiveValue(null);
+                              toast("파일 선택 앱이 없습니다");
+                          }
+                          return true;
+                      }
+                  });
+
+                  web.setDownloadListener(new DownloadListener() {
+                      @Override
+                      public void onDownloadStart(String url, String ua, String disposition,
+                                                  String mime, long length) {
+                          download(url, disposition, mime);
+                      }
+                  });
+
+                  if (saved != null) web.restoreState(saved);
+                  else web.loadUrl(BASE);
+              }
+
+              // ---------- 다운로드 ----------
+              private void download(String url, String disposition, String mime) {
+                  try {
+                      String name = null;
+                      if (disposition != null) {
+                          Matcher m = Pattern.compile("filename\\*=UTF-8''([^;]+)").matcher(disposition);
+                          if (m.find()) name = URLDecoder.decode(m.group(1).replace("+", "%2B"), "UTF-8");
+                      }
+                      if (name == null) name = URLUtil.guessFileName(url, disposition, mime);
+                      DownloadManager.Request r = new DownloadManager.Request(Uri.parse(url));
+                      String cookie = CookieManager.getInstance().getCookie(url);
+                      if (cookie != null) r.addRequestHeader("Cookie", cookie);
+                      r.setTitle(name);
+                      r.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+                      r.setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, name);
+                      ((DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE)).enqueue(r);
+                      toast("다운로드 시작: " + name);
+                  } catch (Exception e) {
+                      toast("다운로드 실패: " + e.getMessage());
+                  }
+              }
+
+              // ---------- 서버 꺼짐 처리 ----------
+              private void showOffline() {
+                  if (offline) return;
+                  offline = true;
+                  web.loadUrl(OFFLINE_PAGE);
+                  if (!triedAutoStart) {          // 앱 켤 때 서버가 꺼져 있으면 한 번 자동으로 켜보기
+                      triedAutoStart = true;
+                      startServer();
+                  }
+                  startProbe();
+              }
+
+              private void startProbe() {
+                  if (probing) return;
+                  probing = true;
+                  handler.postDelayed(probe, 2500);
+              }
+
+              private final Runnable probe = new Runnable() {
+                  @Override
+                  public void run() {
+                      new Thread(new Runnable() {
+                          @Override
+                          public void run() {
+                              final boolean up = serverAlive();
+                              handler.post(new Runnable() {
+                                  @Override
+                                  public void run() {
+                                      if (!offline) { probing = false; return; }
+                                      if (up) {
+                                          probing = false;
+                                          web.clearHistory();
+                                          web.loadUrl(BASE);
+                                      } else {
+                                          handler.postDelayed(MainActivity.this.probe, 3000);
+                                      }
+                                  }
+                              });
+                          }
+                      }).start();
+                  }
+              };
+
+              private boolean serverAlive() {
+                  HttpURLConnection c = null;
+                  try {
+                      c = (HttpURLConnection) new URL(BASE + "login").openConnection();
+                      c.setConnectTimeout(1500);
+                      c.setReadTimeout(1500);
+                      return c.getResponseCode() == 200;
+                  } catch (Exception e) {
+                      return false;
+                  } finally {
+                      if (c != null) c.disconnect();
+                  }
+              }
+
+              /** Termux에 start-nas.sh 실행을 요청. 성공하면 null, 실패하면 이유를 돌려줌 */
+              private String startServer() {
+                  try {
+                      Intent i = new Intent();
+                      i.setClassName("com.termux", "com.termux.app.RunCommandService");
+                      i.setAction("com.termux.RUN_COMMAND");
+                      i.putExtra("com.termux.RUN_COMMAND_PATH", START_SCRIPT);
+                      i.putExtra("com.termux.RUN_COMMAND_BACKGROUND", true);
+                      if (Build.VERSION.SDK_INT >= 26) startForegroundService(i);
+                      else startService(i);
+                      return null;
+                  } catch (SecurityException e) {
+                      return "Termux 권한이 없습니다. Termux를 먼저 설치한 뒤 이 앱을 다시 설치하고, "
+                              + "termux.properties에 allow-external-apps=true를 넣어주세요.";
+                  } catch (Exception e) {
+                      return "Termux를 찾을 수 없습니다. Termux에서 직접 서버를 켜주세요.";
+                  }
+              }
+
+              /** 오프라인 안내 화면(offline.html)에서 부르는 함수들 */
+              private class Bridge {
+                  @JavascriptInterface
+                  public String startServer() {
+                      String err = MainActivity.this.startServer();
+                      return err == null ? "" : err;
+                  }
+
+                  @JavascriptInterface
+                  public void retry() {
+                      handler.post(new Runnable() {
+                          @Override
+                          public void run() {
+                              offline = false;
+                              web.loadUrl(BASE);
+                          }
+                      });
+                  }
+              }
+
+              // ---------- 기타 ----------
+              @Override
+              protected void onActivityResult(int req, int result, Intent data) {
+                  if (req != REQ_FILE || fileCallback == null) {
+                      super.onActivityResult(req, result, data);
+                      return;
+                  }
+                  Uri[] uris = null;
+                  if (result == RESULT_OK && data != null) {
+                      ClipData clip = data.getClipData();
+                      if (clip != null) {
+                          uris = new Uri[clip.getItemCount()];
+                          for (int i = 0; i < uris.length; i++) uris[i] = clip.getItemAt(i).getUri();
+                      } else if (data.getData() != null) {
+                          uris = new Uri[]{data.getData()};
+                      }
+                  }
+                  fileCallback.onReceiveValue(uris);
+                  fileCallback = null;
+              }
+
+              @Override
+              public void onBackPressed() {
+                  if (!offline && web.canGoBack()) web.goBack();
+                  else super.onBackPressed();
+              }
+
+              @Override
+              protected void onResume() {
+                  super.onResume();
+                  web.onResume();
+                  if (offline) startProbe();
+              }
+
+              @Override
+              protected void onPause() {
+                  web.onPause();
+                  CookieManager.getInstance().flush();
+                  super.onPause();
+              }
+
+              @Override
+              protected void onSaveInstanceState(Bundle out) {
+                  super.onSaveInstanceState(out);
+                  web.saveState(out);
+              }
+
+              @Override
+              protected void onDestroy() {
+                  handler.removeCallbacksAndMessages(null);
+                  web.destroy();
+                  super.onDestroy();
+              }
+
+              private void toast(String msg) {
+                  Toast.makeText(this, msg, Toast.LENGTH_SHORT).show();
+              }
+          }
+          __NAS_EOF__
+          mkdir -p "proj/app/src/main/assets"
+          cat > "proj/app/src/main/assets/offline.html" <<'__NAS_EOF__'
+          <!doctype html>
+          <html lang="ko">
+          <head>
+          <meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1">
+          <title>서버 꺼짐</title>
+          <style>
+            body{margin:0;background:#f4f5f7;color:#1d2330;font-family:-apple-system,"Noto Sans KR",sans-serif;font-size:15px}
+            .box{max-width:340px;margin:16vh auto 0;padding:28px 22px;background:#fff;border:1px solid #e4e7ec;border-radius:16px;text-align:center}
+            .ic{font-size:44px;margin-bottom:8px}
+            h1{font-size:19px;margin:0 0 6px}
+            p{color:#6b7385;font-size:13px;line-height:1.6;margin:0 0 18px}
+            button{display:block;width:100%;font:inherit;border:0;border-radius:10px;padding:12px;margin-top:10px;cursor:pointer}
+            .pri{background:#3b6cf6;color:#fff}
+            .sec{background:#f0f3fa;color:#1d2330}
+            #msg{font-size:13px;color:#6b7385;margin-top:14px;min-height:20px}
+            .dot{display:inline-block;width:6px;height:6px;border-radius:3px;background:#3b6cf6;margin-right:6px;animation:b 1s infinite alternate}
+            @keyframes b{from{opacity:.2}to{opacity:1}}
+            @media (prefers-color-scheme:dark){
+              body{background:#14171d;color:#e8eaef}
+              .box{background:#1d2129;border-color:#2b303a}
+              .sec{background:#252a34;color:#e8eaef}
+            }
+          </style>
+          </head>
+          <body>
+          <div class="box">
+            <div class="ic">🔌</div>
+            <h1>NAS 서버가 꺼져 있어요</h1>
+            <p>Termux에서 서버가 실행 중이어야 합니다.<br>서버가 켜지면 자동으로 다시 연결돼요.</p>
+            <button class="pri" onclick="start()">서버 켜기</button>
+            <button class="sec" onclick="retry()">다시 연결</button>
+            <div id="msg"><span class="dot"></span>연결을 기다리는 중…</div>
+          </div>
+          <script>
+            function has(){ return typeof NASApp !== "undefined"; }
+            function msg(t){ document.getElementById("msg").textContent = t; }
+            function start(){
+              if(!has()){ msg("앱 안에서만 사용할 수 있습니다"); return; }
+              var err = NASApp.startServer();
+              msg(err ? err : "서버를 켜는 중… 잠시 기다려주세요");
+            }
+            function retry(){ if(has()) NASApp.retry(); else location.reload(); }
+          </script>
+          </body>
+          </html>
+          __NAS_EOF__
+          mkdir -p "proj/app/src/main/res/xml"
+          cat > "proj/app/src/main/res/xml/network_security_config.xml" <<'__NAS_EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <network-security-config>
+              <!-- 폰 안의 NAS 서버(http)만 허용 -->
+              <domain-config cleartextTrafficPermitted="true">
+                  <domain includeSubdomains="false">127.0.0.1</domain>
+                  <domain includeSubdomains="false">localhost</domain>
+              </domain-config>
+          </network-security-config>
+          __NAS_EOF__
+          mkdir -p "proj/app/src/main/res/values"
+          cat > "proj/app/src/main/res/values/strings.xml" <<'__NAS_EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <resources>
+              <string name="app_name">NAS 관리자</string>
+          </resources>
+          __NAS_EOF__
+          mkdir -p "proj/app/src/main/res/drawable"
+          cat > "proj/app/src/main/res/drawable/ic_launcher.xml" <<'__NAS_EOF__'
+          <?xml version="1.0" encoding="utf-8"?>
+          <!-- 파란 원 안의 서버 모양 아이콘 -->
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="48dp"
+              android:height="48dp"
+              android:viewportWidth="48"
+              android:viewportHeight="48">
+              <path android:fillColor="#3B6CF6"
+                  android:pathData="M24,2A22,22 0,1 1,23.99,2Z" />
+              <path android:fillColor="#FFFFFF"
+                  android:pathData="M13,13h22a2,2 0,0 1,2 2v6a2,2 0,0 1,-2 2h-22a2,2 0,0 1,-2 -2v-6a2,2 0,0 1,2 -2z" />
+              <path android:fillColor="#FFFFFF"
+                  android:pathData="M13,25h22a2,2 0,0 1,2 2v6a2,2 0,0 1,-2 2h-22a2,2 0,0 1,-2 -2v-6a2,2 0,0 1,2 -2z" />
+              <path android:fillColor="#3B6CF6"
+                  android:pathData="M16,16.5h3v3h-3zM16,28.5h3v3h-3zM23,17.25h10v1.5h-10zM23,29.25h10v1.5h-10z" />
+          </vector>
+          __NAS_EOF__
+
+      - name: APK 만들기
+        working-directory: proj
+        run: gradle assembleDebug
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: NAS-admin-apk
+          path: proj/app/build/outputs/apk/debug/*.apk
